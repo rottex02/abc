@@ -1,0 +1,225 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..ab4a8f1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -76,7 +76,7 @@ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer -Wno-infinite-recursion -Wno-array-bounds
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_prioritytest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..31db741 100644
+--- a/defs.h
++++ b/defs.h
+@@ -120,6 +120,7 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int             nice(int);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/param.h b/param.h
+index a7e90ef..6a65d0e 100644
+--- a/param.h
++++ b/param.h
+@@ -12,3 +12,10 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ 
++#define SCHED_RR       0
++#define SCHED_PRIORITY 1
++#define SCHEDPOLICY    SCHED_PRIORITY
++
++#define MINPRIORITY 1
++#define MAXPRIORITY 10
++#define DEFPRIORITY 5
+\ No newline at end of file
+diff --git a/proc.c b/proc.c
+index 806b1b1..c1e67f6 100644
+--- a/proc.c
++++ b/proc.c
+@@ -12,6 +12,8 @@ struct {
+   struct proc proc[NPROC];
+ } ptable;
+ 
++static uint schedclock;  
++
+ static struct proc *initproc;
+ 
+ int nextpid = 1;
+@@ -88,6 +90,8 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->priority = DEFPRIORITY;
++  p->lastrun = schedclock;
+ 
+   release(&ptable.lock);
+ 
+@@ -197,6 +201,7 @@ fork(void)
+     return -1;
+   }
+   np->sz = curproc->sz;
++  np->priority = curproc->priority;
+   np->parent = curproc;
+   *np->tf = *curproc->tf;
+ 
+@@ -332,6 +337,36 @@ scheduler(void)
+ 
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++
++  #if SCHEDPOLICY == SCHED_PRIORITY
++    {
++      struct proc *best = 0;
++
++      // Phase 1: scan the whole table. Highest priority wins;
++      // among equals, the least recently run wins (round-robin).
++      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++        if(p->state != RUNNABLE)
++          continue;
++        if(best == 0 || p->priority > best->priority ||
++           (p->priority == best->priority && p->lastrun < best->lastrun))
++          best = p;
++      }
++
++      // Phase 2: run it until the next timer tick.
++      if(best){
++        p = best;
++        p->lastrun = ++schedclock;
++        c->proc = p;
++        switchuvm(p);
++        p->state = RUNNING;
++
++        swtch(&(c->scheduler), p->context);
++        switchkvm();
++
++        c->proc = 0;
++      }
++    }
++  #else
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
+@@ -350,6 +385,7 @@ scheduler(void)
+       // It should have changed its p->state before coming back.
+       c->proc = 0;
+     }
++  #endif
+     release(&ptable.lock);
+ 
+   }
+@@ -532,3 +568,15 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++
++int
++nice(int n)
++{
++  if(n < MINPRIORITY || n > MAXPRIORITY)
++    return -1;
++  acquire(&ptable.lock);
++  myproc()->priority = n;
++  release(&ptable.lock);
++  return 0;
++}
+\ No newline at end of file
+diff --git a/proc.h b/proc.h
+index 1647114..93a7bf9 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,9 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int priority;
++  uint lastrun;
++
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/syscall.c b/syscall.c
+index ee85261..ebc1780 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,7 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_nice(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_nice]    sys_nice,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..4126e92 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_nice   22
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..bbb73b9 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,12 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_nice(void)
++{
++  int n;
++  if(argint(0, &n) < 0)
++    return -1;
++  return nice(n);
++}
+\ No newline at end of file
+diff --git a/user.h b/user.h
+index 4f99c52..acccabb 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int nice(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..e1eba18 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(nice)
+\ No newline at end of file

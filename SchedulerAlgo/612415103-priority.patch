@@ -1,0 +1,206 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..84da7a6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -76,7 +76,7 @@ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer -Wno-infinite-recursion -Wno-array-bounds
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -181,6 +181,8 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_prioritytest\
++
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..51189f7 100644
+--- a/defs.h
++++ b/defs.h
+@@ -81,6 +81,8 @@ void            lapicinit(void);
+ void            lapicstartap(uchar, uint);
+ void            microdelay(int);
+ 
++void            lapictimerset(uint);
++
+ // log.c
+ void            initlog(int dev);
+ void            log_write(struct buf*);
+@@ -121,6 +123,8 @@ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
+ 
++int             nice(int);
++
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+diff --git a/lapic.c b/lapic.c
+index b22bbd7..8e6f282 100644
+--- a/lapic.c
++++ b/lapic.c
+@@ -227,3 +227,12 @@ cmostime(struct rtcdate *r)
+   *r = t1;
+   r->year += 2000;
+ }
++
++
++void
++lapictimerset(uint count)
++{
++  if(!lapic)
++    return;
++  lapicw(TICR, count);
++}
+\ No newline at end of file
+diff --git a/param.h b/param.h
+index a7e90ef..dee22f1 100644
+--- a/param.h
++++ b/param.h
+@@ -12,3 +12,7 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ 
++#define MINPRIORITY   1
++#define MAXPRIORITY   10
++#define DEFPRIORITY   5
++#define QUANTUM_UNIT  2000000 
+\ No newline at end of file
+diff --git a/proc.c b/proc.c
+index 806b1b1..694e2e2 100644
+--- a/proc.c
++++ b/proc.c
+@@ -88,6 +88,7 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->priority = DEFPRIORITY;
+ 
+   release(&ptable.lock);
+ 
+@@ -200,6 +201,8 @@ fork(void)
+   np->parent = curproc;
+   *np->tf = *curproc->tf;
+ 
++  np->priority = curproc->priority;
++
+   // Clear %eax so that fork returns 0 in the child.
+   np->tf->eax = 0;
+ 
+@@ -343,6 +346,8 @@ scheduler(void)
+       switchuvm(p);
+       p->state = RUNNING;
+ 
++      lapictimerset(p->priority * QUANTUM_UNIT);
++
+       swtch(&(c->scheduler), p->context);
+       switchkvm();
+ 
+@@ -532,3 +537,14 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++int
++nice(int n)
++{
++  if(n < MINPRIORITY || n > MAXPRIORITY)
++    return -1;
++  acquire(&ptable.lock);
++  myproc()->priority = n;
++  release(&ptable.lock);
++  return 0;
++}
+diff --git a/proc.h b/proc.h
+index 1647114..a4d5e27 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int priority;
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/syscall.c b/syscall.c
+index ee85261..452a4db 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -104,6 +104,8 @@ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
+ 
++extern int sys_nice(void);
++
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+ [SYS_exit]    sys_exit,
+@@ -126,6 +128,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++
++[SYS_nice]    sys_nice,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..a7bdb61 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++
++#define SYS_nice   22
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..bbb73b9 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,12 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_nice(void)
++{
++  int n;
++  if(argint(0, &n) < 0)
++    return -1;
++  return nice(n);
++}
+\ No newline at end of file
+diff --git a/user.h b/user.h
+index 4f99c52..30a9aee 100644
+--- a/user.h
++++ b/user.h
+@@ -24,6 +24,8 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ 
++int nice(int);
++
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..2ec76b3 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,5 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++
++SYSCALL(nice)
